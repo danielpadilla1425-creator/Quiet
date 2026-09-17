@@ -8,13 +8,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 3600
 
-    env:
-      CUSTOM_RDP_USER: "workspace"
-      CUSTOM_RDP_PASS: "workspace"
-
     steps:
       - name: Configure Core RDP Settings
         run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -22,29 +19,36 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "SecurityLayer" -Value 0 -Force
 
+          # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Create or Update RDP User with Specific Credentials
+      - name: Create RDP User with Specific Credentials
         run: |
-          $userName = $env:CUSTOM_RDP_USER
-          $password = $env:CUSTOM_RDP_PASS
+          $password = "workspace"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
-          if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
-              Set-LocalUser -Name $userName -Password $securePass
+          if (-not (Get-LocalUser -Name "workspace" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "workspace" -Password $securePass -AccountNeverExpires
           } else {
-              New-LocalUser -Name $userName -Password $securePass -AccountNeverExpires
+              Set-LocalUser -Name "workspace" -Password $securePass
           }
           
-          Add-LocalGroupMember -Group "Administrators" -Member $userName -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $userName -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "workspace" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "workspace" -ErrorAction SilentlyContinue
           
-          echo "RDP_CREDS=User: $userName | Password: $password" >> $env:GITHUB_ENV
-          echo "RDP_USER_NAME=$userName" >> $env:GITHUB_ENV
+          echo "RDP_CREDS=workspace" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "workspace")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
@@ -57,8 +61,10 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
+          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -76,6 +82,8 @@ jobs:
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
@@ -86,11 +94,12 @@ jobs:
       - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP:3389"
-          Write-Host "Username: $env:CUSTOM_RDP_USER"
-          Write-Host "Password: $env:CUSTOM_RDP_PASS"
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: workspace"
+          Write-Host "Password: workspace"
           Write-Host "==================`n"
           
+          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
